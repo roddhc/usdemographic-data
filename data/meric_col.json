@@ -1,0 +1,10 @@
+{
+  "_comment": "City-level COL and grocery index from MERIC quarterly report.",
+  "_instructions": "Run: python tools/parse_meric.py path/to/meric_report.xlsx",
+  "_format": "{ 'cityname_ST': { 'col': 95.2, 'grocery': 98.1 }, ... }",
+  "_example": {
+    "austin_TX":   { "col": 96.5,  "grocery": 97.2  },
+    "dallas_TX":   { "col": 98.1,  "grocery": 95.8  },
+    "denver_CO":   { "col": 107.2, "grocery": 101.5 }
+  }
+}

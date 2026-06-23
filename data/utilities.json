@@ -1,0 +1,31 @@
+{
+  "_comment": "Monthly utility estimates by state. Water/sewer/trash is combined monthly average. Broadband is avg monthly internet bill. Updated 2025.",
+  "_source_water": "American Water Works Association, EPA baseline estimates by region",
+  "_source_broadband": "FCC Broadband Data Collection, BroadbandNow state averages 2024",
+  "water_sewer_trash": {
+    "AK": 95,  "AL": 62,  "AR": 58,  "AZ": 85,  "CA": 110,
+    "CO": 78,  "CT": 88,  "DC": 120, "DE": 72,  "FL": 95,
+    "GA": 68,  "HI": 105, "IA": 60,  "ID": 65,  "IL": 75,
+    "IN": 62,  "KS": 62,  "KY": 58,  "LA": 65,  "MA": 92,
+    "MD": 95,  "ME": 72,  "MI": 75,  "MN": 68,  "MO": 62,
+    "MS": 58,  "MT": 65,  "NC": 68,  "ND": 62,  "NE": 65,
+    "NH": 78,  "NJ": 98,  "NM": 72,  "NV": 88,  "NY": 105,
+    "OH": 68,  "OK": 60,  "OR": 82,  "PA": 75,  "RI": 88,
+    "SC": 65,  "SD": 62,  "TN": 62,  "TX": 72,  "UT": 70,
+    "VA": 75,  "VT": 78,  "WA": 88,  "WI": 68,  "WV": 58,
+    "WY": 65
+  },
+  "broadband_monthly": {
+    "AK": 85,  "AL": 62,  "AR": 58,  "AZ": 68,  "CA": 72,
+    "CO": 68,  "CT": 75,  "DC": 72,  "DE": 68,  "FL": 65,
+    "GA": 62,  "HI": 78,  "IA": 58,  "ID": 62,  "IL": 68,
+    "IN": 60,  "KS": 60,  "KY": 58,  "LA": 60,  "MA": 72,
+    "MD": 70,  "ME": 68,  "MI": 62,  "MN": 62,  "MO": 60,
+    "MS": 58,  "MT": 68,  "NC": 62,  "ND": 62,  "NE": 60,
+    "NH": 72,  "NJ": 78,  "NM": 62,  "NV": 68,  "NY": 75,
+    "OH": 62,  "OK": 60,  "OR": 68,  "PA": 68,  "RI": 75,
+    "SC": 62,  "SD": 62,  "TN": 60,  "TX": 65,  "UT": 62,
+    "VA": 68,  "VT": 72,  "WA": 70,  "WI": 62,  "WV": 62,
+    "WY": 65
+  }
+}

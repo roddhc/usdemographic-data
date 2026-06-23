@@ -1,0 +1,79 @@
+name: Build City Data
+
+on:
+  schedule:
+    # Every Sunday at 02:00 UTC
+    - cron: "0 2 * * 0"
+  workflow_dispatch:
+    # Also allow manual trigger from GitHub Actions UI
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # needed to create releases
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pipeline
+        env:
+          CENSUS_API_KEY:    ${{ secrets.CENSUS_API_KEY }}
+          BLS_API_KEY:       ${{ secrets.BLS_API_KEY }}
+          FBI_API_KEY:       ${{ secrets.FBI_API_KEY }}
+          NOAA_API_KEY:      ${{ secrets.NOAA_API_KEY }}
+          WALKSCORE_API_KEY: ${{ secrets.WALKSCORE_API_KEY }}
+        run: python build_cities.py
+
+      - name: Verify output files exist
+        run: |
+          test -f output/cities_free.json || (echo "cities_free.json missing" && exit 1)
+          test -f output/cities_max.json  || (echo "cities_max.json missing"  && exit 1)
+          test -f output/manifest.json    || (echo "manifest.json missing"    && exit 1)
+          echo "All output files present"
+          wc -c output/cities_free.json output/cities_max.json
+
+      - name: Read version tag from manifest
+        id: version
+        run: |
+          VERSION=$(python -c "import json; print(json.load(open('output/manifest.json'))['version'])")
+          CITY_COUNT=$(python -c "import json; print(json.load(open('output/manifest.json'))['city_count'])")
+          echo "tag=$VERSION" >> $GITHUB_OUTPUT
+          echo "city_count=$CITY_COUNT" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION — $CITY_COUNT cities"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "City Data ${{ steps.version.outputs.tag }}"
+          body: |
+            Automated weekly city data update.
+
+            - **Cities**: ${{ steps.version.outputs.city_count }}
+            - **Generated**: ${{ github.run_id }}
+            - **Sources**: Census ACS 2023, BLS, FBI UCR, NOAA, EIA
+
+            ### Files
+            - `cities_free.json` — Free tier fields (~14 fields per city)
+            - `cities_max.json`  — Full dataset (all 30+ fields per city)
+            - `manifest.json`    — Version metadata
+
+            ### Flutter integration
+            The app checks this release tag on launch via:
+            `https://api.github.com/repos/roddhc/usdemographic-data/releases/latest`
+          files: |
+            output/cities_free.json
+            output/cities_max.json
+            output/manifest.json
+          make_latest: true
+          fail_on_unmatched_files: true

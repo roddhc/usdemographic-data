@@ -1,0 +1,45 @@
+{
+  "_comment": "Gas prices by EIA PADD region (cents/gallon → $/gallon). Electricity by state (cents/kWh). Updated Q1 2025.",
+  "_source_gas": "EIA Weekly Retail Gasoline Prices by Region",
+  "_source_electricity": "EIA Electric Power Monthly, average retail price by state",
+  "gas_by_state": {
+    "AK": 3.89, "AL": 2.89, "AR": 2.85, "AZ": 3.25, "CA": 4.75,
+    "CO": 3.10, "CT": 3.45, "DC": 3.55, "DE": 3.20, "FL": 3.15,
+    "GA": 2.95, "HI": 4.95, "IA": 3.00, "ID": 3.30, "IL": 3.40,
+    "IN": 3.05, "KS": 2.95, "KY": 2.90, "LA": 2.85, "MA": 3.40,
+    "MD": 3.25, "ME": 3.35, "MI": 3.15, "MN": 3.05, "MO": 2.90,
+    "MS": 2.85, "MT": 3.25, "NC": 2.95, "ND": 3.00, "NE": 3.00,
+    "NH": 3.30, "NJ": 3.20, "NM": 3.00, "NV": 3.70, "NY": 3.50,
+    "OH": 3.10, "OK": 2.85, "OR": 3.60, "PA": 3.25, "RI": 3.40,
+    "SC": 2.90, "SD": 3.05, "TN": 2.90, "TX": 2.85, "UT": 3.20,
+    "VA": 3.05, "VT": 3.35, "WA": 3.75, "WI": 3.10, "WV": 2.95,
+    "WY": 3.10
+  },
+  "electricity_cents_per_kwh": {
+    "AK": 24.1, "AL": 12.8, "AR": 10.9, "AZ": 12.3, "CA": 25.0,
+    "CO": 12.2, "CT": 24.5, "DC": 13.5, "DE": 13.0, "FL": 12.5,
+    "GA": 11.5, "HI": 38.0, "IA": 10.0, "ID": 9.2,  "IL": 12.8,
+    "IN": 11.5, "KS": 11.0, "KY": 10.2, "LA": 10.5, "MA": 23.0,
+    "MD": 13.5, "ME": 18.5, "MI": 13.2, "MN": 11.8, "MO": 10.8,
+    "MS": 11.0, "MT": 10.5, "NC": 11.2, "ND": 10.0, "NE": 10.5,
+    "NH": 21.5, "NJ": 16.5, "NM": 12.5, "NV": 12.8, "NY": 20.5,
+    "OH": 12.8, "OK": 10.5, "OR": 11.5, "PA": 14.0, "RI": 22.5,
+    "SC": 12.0, "SD": 11.0, "TN": 11.2, "TX": 11.5, "UT": 10.0,
+    "VA": 12.5, "VT": 18.0, "WA": 9.5,  "WI": 13.0, "WV": 10.5,
+    "WY": 10.0
+  },
+  "_note_electricity": "Monthly bill = kWh * cents/kWh / 100. Average US household uses ~900 kWh/month. Southern states use more (AC), northern less.",
+  "avg_monthly_kwh_by_state": {
+    "AK": 650,  "AL": 1180, "AR": 1080, "AZ": 1150, "CA": 570,
+    "CO": 700,  "CT": 700,  "DC": 750,  "DE": 900,  "FL": 1200,
+    "GA": 1100, "HI": 510,  "IA": 850,  "ID": 950,  "IL": 770,
+    "IN": 920,  "KS": 900,  "KY": 1050, "LA": 1200, "MA": 620,
+    "MD": 1000, "ME": 570,  "MI": 740,  "MN": 790,  "MO": 1050,
+    "MS": 1200, "MT": 870,  "NC": 1100, "ND": 1050, "NE": 1000,
+    "NH": 620,  "NJ": 720,  "NM": 700,  "NV": 900,  "NY": 620,
+    "OH": 890,  "OK": 1100, "OR": 900,  "PA": 830,  "RI": 600,
+    "SC": 1150, "SD": 1100, "TN": 1200, "TX": 1200, "UT": 780,
+    "VA": 1100, "VT": 570,  "WA": 1100, "WI": 770,  "WV": 1100,
+    "WY": 950
+  }
+}
