@@ -711,7 +711,7 @@ def geocode_city(city: str, state: str) -> tuple[float | None, float | None]:
 
 # ── Walk Score ────────────────────────────────────────────────────────────────
 
-WALKSCORE_STATS = {"real": 0, "fallback": 0}
+WALKSCORE_STATS = {"real": 0, "fallback": 0, "status_counts": {}}
 
 def fetch_walkscore(city: str, state: str,
                     lat: float = None, lon: float = None) -> tuple[float, float]:
@@ -726,13 +726,23 @@ def fetch_walkscore(city: str, state: str,
                    f"&transit=1&wsapikey={ws_key}")
             resp = requests.get(url, timeout=10,
                                headers={"User-Agent": "CityCompare-Pipeline/2.0"})
+            time.sleep(CONFIG["request_delay"])
             if resp.status_code == 200:
                 d = resp.json()
-                walk = float(d.get("walkscore", 0) or 0)
-                transit = float((d.get("transit") or {}).get("score", 0) or 0)
-                time.sleep(CONFIG["request_delay"])
-                WALKSCORE_STATS["real"] += 1
-                return walk, transit
+                status = d.get("status")
+                WALKSCORE_STATS["status_counts"][str(status)] = (
+                    WALKSCORE_STATS["status_counts"].get(str(status), 0) + 1)
+                # Only status 1 means a real score was returned. Status 2 =
+                # still calculating, 30/31 = bad coords / server error,
+                # 40/41/42 = key/quota/IP problems. Any of those leave
+                # "walkscore" absent or meaningless — treating it as 0
+                # would silently fabricate a fake score, so fall through
+                # to the state default instead.
+                if status == 1:
+                    walk = float(d.get("walkscore", 0) or 0)
+                    transit = float((d.get("transit") or {}).get("score", 0) or 0)
+                    WALKSCORE_STATS["real"] += 1
+                    return walk, transit
         except Exception as e:
             log.debug(f"Walk Score failed for {city}, {state}: {e}")
 
@@ -973,6 +983,7 @@ def main():
                 "mode": "real API" if CONFIG["walkscore_key"] else "state defaults",
                 "cities_real":     WALKSCORE_STATS["real"],
                 "cities_fallback": WALKSCORE_STATS["fallback"],
+                "status_counts":   WALKSCORE_STATS["status_counts"],
             },
         },
         "files": {
