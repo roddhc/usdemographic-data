@@ -506,6 +506,8 @@ def fetch_bls_state_data(states: list[str]) -> dict[str, tuple[float, float]]:
 
 # ── FBI Crime Data Explorer ───────────────────────────────────────────────────
 
+FBI_STATS = {"real": 0, "fallback": 0}
+
 def fetch_fbi_state_data(states: list[str]) -> dict[str, tuple[float, float, str]]:
     """
     Fetch violent and property crime rates per 100k population for all states.
@@ -513,10 +515,16 @@ def fetch_fbi_state_data(states: list[str]) -> dict[str, tuple[float, float, str
 
     FBI CDE API endpoint: /api/summarized/state/{state_abbr}/offenses/{year}
     Uses api.data.gov key (same key works for FBI CDE).
+
+    NOTE: this endpoint only returns violent-crime figures — property crime
+    is not fetched from a real source here and always uses the static state
+    fallback. That's a coverage gap, not a bug: adding a real property-crime
+    fetch would be a separate enhancement.
     """
     fbi_key = CONFIG["fbi_key"]
     if not fbi_key:
         log.warning("FBI_API_KEY not set — using static fallback data")
+        FBI_STATS["fallback"] += len(states)
         return {
             s: (float(FBI_STATE_VIOLENT_FALLBACK.get(s, 380)),
                 float(FBI_STATE_PROPERTY_FALLBACK.get(s, 1954)),
@@ -528,63 +536,66 @@ def fetch_fbi_state_data(states: list[str]) -> dict[str, tuple[float, float, str
     base = "https://api.usa.gov/crime/fbi/cde"
 
     for state in states:
-        try:
-            # Fetch violent crime for the state
-            url = f"{base}/summarized/state/{state}/violent-crime?from=2022&to=2022&API_KEY={fbi_key}"
-            resp = requests.get(url, timeout=15,
-                               headers={"User-Agent": "CityCompare-Pipeline/2.0"})
+        violent = 0.0
+        prop = 0.0
+        got_real_data = False
 
-            if resp.status_code == 200:
-                data = resp.json()
-                # FBI CDE returns list of {data_year, offense, state_abbr,
-                # population, offenses, crime_rate}
-                violent = 0.0
-                prop = 0.0
-                for entry in data:
-                    offense = entry.get("offense", "").lower()
-                    rate = float(entry.get("crime_rate", 0) or 0)
-                    if "violent" in offense or offense in ("aggravated-assault",
-                                                           "robbery", "rape",
-                                                           "murder"):
-                        violent += rate
-                    elif "property" in offense or offense in ("burglary",
-                                                               "larceny",
-                                                               "motor-vehicle-theft"):
-                        prop += rate
+        # Retry a couple of times on connection-level failures — the FBI
+        # CDE backend behind api.usa.gov is known to be flaky/unstable
+        # (gateway "upstream connect error" resets), and these are often
+        # transient rather than a request-format problem.
+        for attempt in range(3):
+            try:
+                url = f"{base}/summarized/state/{state}/violent-crime?from=2022&to=2022&API_KEY={fbi_key}"
+                resp = requests.get(url, timeout=15,
+                                   headers={"User-Agent": "CityCompare-Pipeline/2.0"})
 
-                # If the API returned aggregate violent/property totals, use those
-                # Otherwise use sum of components
-                for entry in data:
-                    if entry.get("offense", "").lower() == "violent-crime":
-                        violent = float(entry.get("crime_rate", violent) or violent)
-                    if entry.get("offense", "").lower() == "property-crime":
-                        prop = float(entry.get("crime_rate", prop) or prop)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    # FBI CDE returns list of {data_year, offense, state_abbr,
+                    # population, offenses, crime_rate}
+                    for entry in data:
+                        offense = entry.get("offense", "").lower()
+                        rate = float(entry.get("crime_rate", 0) or 0)
+                        if "violent" in offense or offense in ("aggravated-assault",
+                                                               "robbery", "rape",
+                                                               "murder"):
+                            violent += rate
+                        elif "property" in offense or offense in ("burglary",
+                                                                   "larceny",
+                                                                   "motor-vehicle-theft"):
+                            prop += rate
 
-                if violent == 0:
-                    violent = float(FBI_STATE_VIOLENT_FALLBACK.get(state, 380))
-                if prop == 0:
-                    prop = float(FBI_STATE_PROPERTY_FALLBACK.get(state, 1954))
+                    for entry in data:
+                        if entry.get("offense", "").lower() == "violent-crime":
+                            violent = float(entry.get("crime_rate", violent) or violent)
+                        if entry.get("offense", "").lower() == "property-crime":
+                            prop = float(entry.get("crime_rate", prop) or prop)
 
-                result[state] = (round(violent, 1), round(prop, 1), "moderate")
-            else:
-                log.warning(f"FBI API returned {resp.status_code} for {state} — using fallback")
-                result[state] = (
-                    float(FBI_STATE_VIOLENT_FALLBACK.get(state, 380)),
-                    float(FBI_STATE_PROPERTY_FALLBACK.get(state, 1954)),
-                    "moderate",
-                )
+                    if violent > 0:
+                        got_real_data = True
+                    break  # got an actual HTTP response, stop retrying
+                else:
+                    log.warning(f"FBI API returned {resp.status_code} for {state} "
+                               f"(attempt {attempt + 1}/3)")
+            except Exception as e:
+                log.warning(f"FBI fetch failed for {state}: {e} "
+                           f"(attempt {attempt + 1}/3)")
 
-            time.sleep(CONFIG["request_delay"])
+            if attempt < 2:
+                time.sleep(3 * (attempt + 1))  # 3s, then 6s backoff
 
-        except Exception as e:
-            log.warning(f"FBI fetch failed for {state}: {e} — using fallback")
-            result[state] = (
-                float(FBI_STATE_VIOLENT_FALLBACK.get(state, 380)),
-                float(FBI_STATE_PROPERTY_FALLBACK.get(state, 1954)),
-                "moderate",
-            )
+        if not got_real_data:
+            violent = float(FBI_STATE_VIOLENT_FALLBACK.get(state, 380))
+        if prop == 0:
+            prop = float(FBI_STATE_PROPERTY_FALLBACK.get(state, 1954))
 
-    log.info(f"FBI crime data: retrieved {len([s for s in result])} states")
+        FBI_STATS["real" if got_real_data else "fallback"] += 1
+        result[state] = (round(violent, 1), round(prop, 1), "moderate")
+        time.sleep(CONFIG["request_delay"])
+
+    log.info(f"FBI crime data: {FBI_STATS['real']} real, "
+            f"{FBI_STATS['fallback']} fallback (of {len(states)} states)")
     return result
 
 # ── NOAA Climate Data Online ──────────────────────────────────────────────────
@@ -990,7 +1001,11 @@ def main():
         "api_sources": {
             "census":    "ACS 5-Year 2023",
             "bls":       "real API" if CONFIG["bls_key"] else "static fallback",
-            "fbi":       "real API" if CONFIG["fbi_key"] else "static fallback",
+            "fbi":       {
+                "mode": "real API" if CONFIG["fbi_key"] else "static fallback",
+                "states_real":     FBI_STATS["real"],
+                "states_fallback": FBI_STATS["fallback"],
+            },
             "noaa":      "real API" if CONFIG["noaa_key"] else "static fallback",
             "walkscore": {
                 "mode": "real API" if CONFIG["walkscore_key"] else "state defaults",
