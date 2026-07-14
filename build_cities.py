@@ -739,10 +739,23 @@ def fetch_walkscore(city: str, state: str,
                 # would silently fabricate a fake score, so fall through
                 # to the state default instead.
                 if status == 1:
-                    walk = float(d.get("walkscore", 0) or 0)
-                    transit = float((d.get("transit") or {}).get("score", 0) or 0)
-                    WALKSCORE_STATS["real"] += 1
-                    return walk, transit
+                    raw_walk = d.get("walkscore")
+                    if raw_walk is not None and float(raw_walk) > 0:
+                        walk = float(raw_walk)
+                        transit = float((d.get("transit") or {}).get("score") or 0)
+                        WALKSCORE_STATS["real"] += 1
+                        return walk, transit
+                    else:
+                        # status says "success" but there's no usable score
+                        # (missing or literally 0 — no real US city legitimately
+                        # scores 0). Print the raw payload for the first few
+                        # cases so we can see exactly what came back, instead
+                        # of silently trusting it or guessing again.
+                        n = WALKSCORE_STATS.get("_zero_logged", 0)
+                        if n < 8:
+                            print(f"[walkscore-debug] {city}, {state} "
+                                  f"lat={lat} lon={lon} raw_response={d}")
+                            WALKSCORE_STATS["_zero_logged"] = n + 1
         except Exception as e:
             log.debug(f"Walk Score failed for {city}, {state}: {e}")
 
