@@ -1,1 +1,9 @@
 requests>=2.31.0
+
+# Offline city-centroid lookup for Walk Score geocoding (see geocode_city()
+# in build_cities.py). Pinned because uszipcode's latest sqlalchemy_mate
+# dependency breaks against SQLAlchemy 2.x — verified working combo below.
+uszipcode==1.0.1
+sqlalchemy_mate==1.4.28.4
+SQLAlchemy<2
+python-Levenshtein>=0.20.0
