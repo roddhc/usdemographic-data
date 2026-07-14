@@ -411,7 +411,7 @@ def fetch_census_acs(state_abbr: str) -> dict:
 # ── BLS API v2 ────────────────────────────────────────────────────────────────
 
 BLS_STATS = {"unemployment_real": 0, "unemployment_fallback": 0,
-             "wage_real": 0, "wage_fallback": 0}
+             "wage_real": 0, "wage_fallback": 0, "_qcew_debug_count": 0}
 
 def fetch_qcew_wage_growth(state: str) -> float | None:
     """
@@ -438,13 +438,26 @@ def fetch_qcew_wage_growth(state: str) -> float | None:
             resp = requests.get(url, timeout=15,
                                headers={"User-Agent": "CityCompare-Pipeline/2.0"})
             if resp.status_code != 200:
+                if BLS_STATS["_qcew_debug_count"] < 8:
+                    log.warning(f"[qcew-debug] {state} {year}: HTTP {resp.status_code}, "
+                               f"body starts: {resp.text[:200]!r}")
+                    BLS_STATS["_qcew_debug_count"] += 1
                 return None
             reader = csv.DictReader(resp.text.splitlines())
+            rows_seen = 0
             for row in reader:
+                rows_seen += 1
                 if row.get("own_code") == "0" and row.get("industry_code") == "10":
                     return float(row["avg_wkly_wage"])
+            if BLS_STATS["_qcew_debug_count"] < 8:
+                log.warning(f"[qcew-debug] {state} {year}: got 200 and {rows_seen} rows "
+                           f"but none matched own_code=0/industry_code=10. "
+                           f"Columns seen: {reader.fieldnames}")
+                BLS_STATS["_qcew_debug_count"] += 1
         except Exception as e:
-            log.debug(f"QCEW wage fetch failed for {state} {year}: {e}")
+            if BLS_STATS["_qcew_debug_count"] < 8:
+                log.warning(f"[qcew-debug] {state} {year} exception: {e!r}")
+                BLS_STATS["_qcew_debug_count"] += 1
         return None
 
     wage_prior = get_avg_weekly_wage("2023")
@@ -552,19 +565,20 @@ def fetch_bls_state_data(states: list[str]) -> dict[str, tuple[float, float]]:
 # ── FBI Crime Data Explorer ───────────────────────────────────────────────────
 
 FBI_STATS = {"violent_real": 0, "violent_fallback": 0,
-             "property_real": 0, "property_fallback": 0}
+             "property_real": 0, "property_fallback": 0,
+             "circuit_tripped": False}
 
 def _fetch_fbi_offense_rate(state: str, offense: str, fbi_key: str) -> float | None:
     """
     Fetch one offense category's crime rate per 100k for one state from
-    the FBI CDE API. Returns None on any failure (missing/error response,
-    or a rate that never comes back > 0) so the caller can fall back.
-    Retries a few times on connection-level failures — the CDE backend
-    behind api.usa.gov is known to be flaky ("upstream connect error"
-    gateway resets), and these are often transient.
+    the FBI CDE API. Returns None on any failure so the caller can fall
+    back. Retries once on connection-level failures (short backoff) —
+    enough to ride out a brief blip without adding much time when the
+    backend is genuinely down for hours, which is what we've observed
+    across several runs today.
     """
     base = "https://api.usa.gov/crime/fbi/cde"
-    for attempt in range(3):
+    for attempt in range(2):
         try:
             url = f"{base}/summarized/state/{state}/{offense}?from=2022&to=2022&API_KEY={fbi_key}"
             resp = requests.get(url, timeout=15,
@@ -578,12 +592,12 @@ def _fetch_fbi_offense_rate(state: str, offense: str, fbi_key: str) -> float | N
                 return rate if rate > 0 else None
             else:
                 log.warning(f"FBI API returned {resp.status_code} for {state} "
-                           f"{offense} (attempt {attempt + 1}/3)")
+                           f"{offense} (attempt {attempt + 1}/2)")
         except Exception as e:
             log.warning(f"FBI fetch failed for {state} {offense}: {e} "
-                       f"(attempt {attempt + 1}/3)")
-        if attempt < 2:
-            time.sleep(3 * (attempt + 1))  # 3s, then 6s backoff
+                       f"(attempt {attempt + 1}/2)")
+        if attempt == 0:
+            time.sleep(2)
     return None
 
 
@@ -596,6 +610,14 @@ def fetch_fbi_state_data(states: list[str]) -> dict[str, tuple[float, float, str
     Uses api.data.gov key (same key works for FBI CDE). Violent and
     property crime are separate offense-specific endpoints, so each is
     fetched with its own call rather than assumed from one response.
+
+    Circuit breaker: if the first CIRCUIT_BREAKER_THRESHOLD states in a
+    row completely fail (both offenses, all attempts), we stop making
+    live HTTP calls for the rest of this run and go straight to fallback.
+    The FBI CDE backend behind api.usa.gov has been down for hours across
+    multiple runs today — continuing to retry every remaining state would
+    burn ~40 minutes of CI time for no benefit. The next scheduled run
+    tries again from scratch.
     """
     fbi_key = CONFIG["fbi_key"]
     if not fbi_key:
@@ -610,12 +632,30 @@ def fetch_fbi_state_data(states: list[str]) -> dict[str, tuple[float, float, str
         }
 
     result = {}
+    CIRCUIT_BREAKER_THRESHOLD = 5
+    consecutive_full_failures = 0
 
     for state in states:
-        violent = _fetch_fbi_offense_rate(state, "violent-crime", fbi_key)
-        time.sleep(CONFIG["request_delay"])
-        prop = _fetch_fbi_offense_rate(state, "property-crime", fbi_key)
-        time.sleep(CONFIG["request_delay"])
+        if FBI_STATS["circuit_tripped"]:
+            violent, prop = None, None
+        else:
+            violent = _fetch_fbi_offense_rate(state, "violent-crime", fbi_key)
+            time.sleep(CONFIG["request_delay"])
+            prop = _fetch_fbi_offense_rate(state, "property-crime", fbi_key)
+            time.sleep(CONFIG["request_delay"])
+
+            if violent is None and prop is None:
+                consecutive_full_failures += 1
+                if consecutive_full_failures >= CIRCUIT_BREAKER_THRESHOLD:
+                    FBI_STATS["circuit_tripped"] = True
+                    log.warning(
+                        f"FBI CDE: {CIRCUIT_BREAKER_THRESHOLD} states in a row "
+                        f"failed completely — backend looks fully down. "
+                        f"Switching to fallback for all remaining states "
+                        f"rather than continuing to retry."
+                    )
+            else:
+                consecutive_full_failures = 0
 
         if violent is not None:
             FBI_STATS["violent_real"] += 1
@@ -1057,6 +1097,7 @@ def main():
             },
             "fbi":       {
                 "mode": "real API" if CONFIG["fbi_key"] else "static fallback",
+                "circuit_breaker_tripped": FBI_STATS["circuit_tripped"],
                 "violent_states_real":      FBI_STATS["violent_real"],
                 "violent_states_fallback":  FBI_STATS["violent_fallback"],
                 "property_states_real":     FBI_STATS["property_real"],
