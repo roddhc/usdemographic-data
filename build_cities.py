@@ -6,7 +6,8 @@ Produces cities_free.json and cities_max.json for GitHub Releases.
 Phase 1 (this version — all Free-tier fields from real APIs):
   - Census ACS 5-Year: population, medianHomePrice, medianMonthlyRent,
     medianHouseholdIncome, avgCommuteMinutes, effectivePropertyTaxRate
-  - BLS API v2: unemploymentRate (LAUS), yoyWageGrowthRate (QCEW)
+  - BLS API v2: unemploymentRate (LAUS)
+  - BLS QCEW public CSV (no key needed): yoyWageGrowthRate
   - FBI Crime Data Explorer: violentCrimeRatePer100k, propertyCrimeRatePer100k
   - NOAA CDO API: heatingDegreeDays, coolingDegreeDays
   - Walk Score API: walkabilityScore (if key available; state defaults otherwise)
@@ -30,6 +31,7 @@ Usage:
     WALKSCORE_API_KEY — walkscore.com/professional/api.php
 """
 
+import csv
 import json
 import os
 import re
@@ -408,15 +410,64 @@ def fetch_census_acs(state_abbr: str) -> dict:
 
 # ── BLS API v2 ────────────────────────────────────────────────────────────────
 
+BLS_STATS = {"unemployment_real": 0, "unemployment_fallback": 0,
+             "wage_real": 0, "wage_fallback": 0}
+
+def fetch_qcew_wage_growth(state: str) -> float | None:
+    """
+    Real year-over-year average weekly wage growth (%) for a state, from
+    BLS QCEW's public Open Data Access CSV files:
+      https://data.bls.gov/cew/data/api/{year}/a/area/{state_fips}000.csv
+    This is a public static file — no API key needed, and no fragile
+    hand-built series ID (QCEW timeseries series IDs pack area/datatype/
+    size/ownership/industry codes into one string, which is easy to get
+    subtly wrong). We fetch the state-total, all-industries row
+    (own_code=0, industry_code=10) for two years and compute % change
+    ourselves from avg_wkly_wage, rather than trust a column name we
+    haven't verified exists in the annual file layout.
+    Returns None if either year's row can't be found.
+    """
+    fips = STATE_FIPS.get(state)
+    if not fips:
+        return None
+    area = f"{fips}000"
+
+    def get_avg_weekly_wage(year: str) -> float | None:
+        url = f"https://data.bls.gov/cew/data/api/{year}/a/area/{area}.csv"
+        try:
+            resp = requests.get(url, timeout=15,
+                               headers={"User-Agent": "CityCompare-Pipeline/2.0"})
+            if resp.status_code != 200:
+                return None
+            reader = csv.DictReader(resp.text.splitlines())
+            for row in reader:
+                if row.get("own_code") == "0" and row.get("industry_code") == "10":
+                    return float(row["avg_wkly_wage"])
+        except Exception as e:
+            log.debug(f"QCEW wage fetch failed for {state} {year}: {e}")
+        return None
+
+    wage_prior = get_avg_weekly_wage("2023")
+    time.sleep(CONFIG["request_delay"])
+    wage_current = get_avg_weekly_wage("2024")
+    time.sleep(CONFIG["request_delay"])
+
+    if wage_prior and wage_current and wage_prior > 0:
+        return round((wage_current - wage_prior) / wage_prior * 100, 1)
+    return None
+
+
 def fetch_bls_state_data(states: list[str]) -> dict[str, tuple[float, float]]:
     """
-    Fetch unemployment rate and wage growth for all states in one batched call.
+    Fetch unemployment rate (BLS API v2, LAUS series) and wage growth
+    (QCEW public CSV, see fetch_qcew_wage_growth) for all states.
     Returns dict: state_abbr -> (unemployment_rate, yoy_wage_growth)
-    BLS API v2: up to 50 series per request, 500 requests/day.
     """
     bls_key = CONFIG["bls_key"]
     if not bls_key:
         log.warning("BLS_API_KEY not set — using static fallback data")
+        BLS_STATS["unemployment_fallback"] += len(states)
+        BLS_STATS["wage_fallback"] += len(states)
         return {
             s: (BLS_STATE_UNEMPLOYMENT_FALLBACK.get(s, 4.0),
                 BLS_STATE_WAGE_GROWTH_FALLBACK.get(s, 4.0))
@@ -427,10 +478,6 @@ def fetch_bls_state_data(states: list[str]) -> dict[str, tuple[float, float]]:
 
     # Unemployment: LAUS state series (series code ends in 003 = unemployment rate)
     unemp_series = [BLS_STATE_LAUS_SERIES[s] for s in states if s in BLS_STATE_LAUS_SERIES]
-
-    # Wage growth: QCEW quarterly census of employment and wages
-    # Series format: ENU{state_fips}00005{quarter} — we use annual average (10 = annual)
-    wage_series = [f"ENU{STATE_FIPS[s]}005010" for s in states if s in STATE_FIPS]
 
     def fetch_bls_batch(series_ids: list[str], label: str) -> dict[str, float]:
         """Fetch a batch of BLS series. Returns series_id -> latest value."""
@@ -476,55 +523,85 @@ def fetch_bls_state_data(states: list[str]) -> dict[str, tuple[float, float]]:
 
     # Fetch unemployment
     unemp_data = fetch_bls_batch(unemp_series, "unemployment")
-    time.sleep(CONFIG["request_delay"])
-
-    # Fetch wage growth (uses separate series)
-    wage_data = fetch_bls_batch(wage_series, "wages")
-    time.sleep(CONFIG["request_delay"])
-
-    # Map back to state abbreviations
-    reverse_laus = {v: k for k, v in BLS_STATE_LAUS_SERIES.items()}
 
     for state in states:
         laus_sid = BLS_STATE_LAUS_SERIES.get(state, "")
-        unemp = unemp_data.get(laus_sid, BLS_STATE_UNEMPLOYMENT_FALLBACK.get(state, 4.0))
+        if laus_sid in unemp_data:
+            unemp = unemp_data[laus_sid]
+            BLS_STATS["unemployment_real"] += 1
+        else:
+            unemp = BLS_STATE_UNEMPLOYMENT_FALLBACK.get(state, 4.0)
+            BLS_STATS["unemployment_fallback"] += 1
 
-        fips = STATE_FIPS.get(state, "")
-        wage_sid = f"ENU{fips}005010"
-        # Wage growth: compare 2024 to 2023 average wages
-        # The series returns average weekly wages; we compute YoY %
-        # For simplicity we use our static table as a reasonable proxy
-        # until we build the proper two-year comparison logic
-        wage_growth = BLS_STATE_WAGE_GROWTH_FALLBACK.get(state, 4.0)
-        if wage_sid in wage_data:
-            # Real BLS data available — use static for now, will enhance in Phase 2
+        # Wage growth: real QCEW fetch, two years, computed ourselves
+        wage_growth = fetch_qcew_wage_growth(state)
+        if wage_growth is not None:
+            BLS_STATS["wage_real"] += 1
+        else:
             wage_growth = BLS_STATE_WAGE_GROWTH_FALLBACK.get(state, 4.0)
+            BLS_STATS["wage_fallback"] += 1
 
         result[state] = (round(unemp, 1), round(wage_growth, 1))
 
+    log.info(f"BLS unemployment: {BLS_STATS['unemployment_real']} real, "
+            f"{BLS_STATS['unemployment_fallback']} fallback")
+    log.info(f"QCEW wage growth: {BLS_STATS['wage_real']} real, "
+            f"{BLS_STATS['wage_fallback']} fallback")
     return result
 
 # ── FBI Crime Data Explorer ───────────────────────────────────────────────────
 
-FBI_STATS = {"real": 0, "fallback": 0}
+FBI_STATS = {"violent_real": 0, "violent_fallback": 0,
+             "property_real": 0, "property_fallback": 0}
+
+def _fetch_fbi_offense_rate(state: str, offense: str, fbi_key: str) -> float | None:
+    """
+    Fetch one offense category's crime rate per 100k for one state from
+    the FBI CDE API. Returns None on any failure (missing/error response,
+    or a rate that never comes back > 0) so the caller can fall back.
+    Retries a few times on connection-level failures — the CDE backend
+    behind api.usa.gov is known to be flaky ("upstream connect error"
+    gateway resets), and these are often transient.
+    """
+    base = "https://api.usa.gov/crime/fbi/cde"
+    for attempt in range(3):
+        try:
+            url = f"{base}/summarized/state/{state}/{offense}?from=2022&to=2022&API_KEY={fbi_key}"
+            resp = requests.get(url, timeout=15,
+                               headers={"User-Agent": "CityCompare-Pipeline/2.0"})
+            if resp.status_code == 200:
+                data = resp.json()
+                rate = 0.0
+                for entry in data:
+                    if entry.get("offense", "").lower() == offense:
+                        rate = float(entry.get("crime_rate", 0) or 0)
+                return rate if rate > 0 else None
+            else:
+                log.warning(f"FBI API returned {resp.status_code} for {state} "
+                           f"{offense} (attempt {attempt + 1}/3)")
+        except Exception as e:
+            log.warning(f"FBI fetch failed for {state} {offense}: {e} "
+                       f"(attempt {attempt + 1}/3)")
+        if attempt < 2:
+            time.sleep(3 * (attempt + 1))  # 3s, then 6s backoff
+    return None
+
 
 def fetch_fbi_state_data(states: list[str]) -> dict[str, tuple[float, float, str]]:
     """
     Fetch violent and property crime rates per 100k population for all states.
     Returns: state_abbr -> (violent_per_100k, property_per_100k, confidence)
 
-    FBI CDE API endpoint: /api/summarized/state/{state_abbr}/offenses/{year}
-    Uses api.data.gov key (same key works for FBI CDE).
-
-    NOTE: this endpoint only returns violent-crime figures — property crime
-    is not fetched from a real source here and always uses the static state
-    fallback. That's a coverage gap, not a bug: adding a real property-crime
-    fetch would be a separate enhancement.
+    FBI CDE API endpoint: /api/summarized/state/{state_abbr}/{offense}
+    Uses api.data.gov key (same key works for FBI CDE). Violent and
+    property crime are separate offense-specific endpoints, so each is
+    fetched with its own call rather than assumed from one response.
     """
     fbi_key = CONFIG["fbi_key"]
     if not fbi_key:
         log.warning("FBI_API_KEY not set — using static fallback data")
-        FBI_STATS["fallback"] += len(states)
+        FBI_STATS["violent_fallback"] += len(states)
+        FBI_STATS["property_fallback"] += len(states)
         return {
             s: (float(FBI_STATE_VIOLENT_FALLBACK.get(s, 380)),
                 float(FBI_STATE_PROPERTY_FALLBACK.get(s, 1954)),
@@ -533,72 +610,36 @@ def fetch_fbi_state_data(states: list[str]) -> dict[str, tuple[float, float, str
         }
 
     result = {}
-    base = "https://api.usa.gov/crime/fbi/cde"
 
     for state in states:
-        violent = 0.0
-        prop = 0.0
-        got_real_data = False
-
-        # Retry a couple of times on connection-level failures — the FBI
-        # CDE backend behind api.usa.gov is known to be flaky/unstable
-        # (gateway "upstream connect error" resets), and these are often
-        # transient rather than a request-format problem.
-        for attempt in range(3):
-            try:
-                url = f"{base}/summarized/state/{state}/violent-crime?from=2022&to=2022&API_KEY={fbi_key}"
-                resp = requests.get(url, timeout=15,
-                                   headers={"User-Agent": "CityCompare-Pipeline/2.0"})
-
-                if resp.status_code == 200:
-                    data = resp.json()
-                    # FBI CDE returns list of {data_year, offense, state_abbr,
-                    # population, offenses, crime_rate}
-                    for entry in data:
-                        offense = entry.get("offense", "").lower()
-                        rate = float(entry.get("crime_rate", 0) or 0)
-                        if "violent" in offense or offense in ("aggravated-assault",
-                                                               "robbery", "rape",
-                                                               "murder"):
-                            violent += rate
-                        elif "property" in offense or offense in ("burglary",
-                                                                   "larceny",
-                                                                   "motor-vehicle-theft"):
-                            prop += rate
-
-                    for entry in data:
-                        if entry.get("offense", "").lower() == "violent-crime":
-                            violent = float(entry.get("crime_rate", violent) or violent)
-                        if entry.get("offense", "").lower() == "property-crime":
-                            prop = float(entry.get("crime_rate", prop) or prop)
-
-                    if violent > 0:
-                        got_real_data = True
-                    break  # got an actual HTTP response, stop retrying
-                else:
-                    log.warning(f"FBI API returned {resp.status_code} for {state} "
-                               f"(attempt {attempt + 1}/3)")
-            except Exception as e:
-                log.warning(f"FBI fetch failed for {state}: {e} "
-                           f"(attempt {attempt + 1}/3)")
-
-            if attempt < 2:
-                time.sleep(3 * (attempt + 1))  # 3s, then 6s backoff
-
-        if not got_real_data:
-            violent = float(FBI_STATE_VIOLENT_FALLBACK.get(state, 380))
-        if prop == 0:
-            prop = float(FBI_STATE_PROPERTY_FALLBACK.get(state, 1954))
-
-        FBI_STATS["real" if got_real_data else "fallback"] += 1
-        result[state] = (round(violent, 1), round(prop, 1), "moderate")
+        violent = _fetch_fbi_offense_rate(state, "violent-crime", fbi_key)
+        time.sleep(CONFIG["request_delay"])
+        prop = _fetch_fbi_offense_rate(state, "property-crime", fbi_key)
         time.sleep(CONFIG["request_delay"])
 
-    log.info(f"FBI crime data: {FBI_STATS['real']} real, "
-            f"{FBI_STATS['fallback']} fallback (of {len(states)} states)")
+        if violent is not None:
+            FBI_STATS["violent_real"] += 1
+        else:
+            violent = float(FBI_STATE_VIOLENT_FALLBACK.get(state, 380))
+            FBI_STATS["violent_fallback"] += 1
+
+        if prop is not None:
+            FBI_STATS["property_real"] += 1
+        else:
+            prop = float(FBI_STATE_PROPERTY_FALLBACK.get(state, 1954))
+            FBI_STATS["property_fallback"] += 1
+
+        result[state] = (round(violent, 1), round(prop, 1), "moderate")
+
+    log.info(f"FBI violent crime: {FBI_STATS['violent_real']} real, "
+            f"{FBI_STATS['violent_fallback']} fallback")
+    log.info(f"FBI property crime: {FBI_STATS['property_real']} real, "
+            f"{FBI_STATS['property_fallback']} fallback")
     return result
 
 # ── NOAA Climate Data Online ──────────────────────────────────────────────────
+
+NOAA_STATS = {"real": 0, "fallback": 0}
 
 def fetch_noaa_climate_data(states: list[str]) -> dict[str, tuple[float, float]]:
     """
@@ -611,6 +652,7 @@ def fetch_noaa_climate_data(states: list[str]) -> dict[str, tuple[float, float]]
     noaa_key = CONFIG["noaa_key"]
     if not noaa_key:
         log.warning("NOAA_API_KEY not set — using static climate fallback data")
+        NOAA_STATS["fallback"] += len(states)
         return {
             s: (float(NOAA_STATE_CLIMATE_FALLBACK.get(s, (4500, 1500))[0]),
                 float(NOAA_STATE_CLIMATE_FALLBACK.get(s, (4500, 1500))[1]))
@@ -629,6 +671,7 @@ def fetch_noaa_climate_data(states: list[str]) -> dict[str, tuple[float, float]]
         if not station_id:
             hdd, cdd = NOAA_STATE_CLIMATE_FALLBACK.get(state, (4500, 1500))
             result[state] = (float(hdd), float(cdd))
+            NOAA_STATS["fallback"] += 1
             continue
 
         try:
@@ -668,6 +711,9 @@ def fetch_noaa_climate_data(states: list[str]) -> dict[str, tuple[float, float]]
                 hdd_val = hdd_val or float(fb[0])
                 cdd_val = cdd_val or float(fb[1])
                 log.debug(f"NOAA partial fallback for {state}: HDD={hdd_val}, CDD={cdd_val}")
+                NOAA_STATS["fallback"] += 1
+            else:
+                NOAA_STATS["real"] += 1
 
             result[state] = (round(hdd_val, 1), round(cdd_val, 1))
             time.sleep(CONFIG["request_delay"])
@@ -676,8 +722,10 @@ def fetch_noaa_climate_data(states: list[str]) -> dict[str, tuple[float, float]]
             log.warning(f"NOAA fetch failed for {state}: {e} — using fallback")
             fb = NOAA_STATE_CLIMATE_FALLBACK.get(state, (4500, 1500))
             result[state] = (float(fb[0]), float(fb[1]))
+            NOAA_STATS["fallback"] += 1
 
-    log.info(f"NOAA climate data: retrieved {len(result)} states")
+    log.info(f"NOAA climate data: {NOAA_STATS['real']} real, "
+            f"{NOAA_STATS['fallback']} fallback (of {len(states)} states)")
     return result
 
 # ── Geocoding (uszipcode — offline city-centroid lookup) ──────────────────────
@@ -1000,13 +1048,25 @@ def main():
         "free_fields": sorted(FREE_FIELDS),
         "api_sources": {
             "census":    "ACS 5-Year 2023",
-            "bls":       "real API" if CONFIG["bls_key"] else "static fallback",
+            "bls":       {
+                "mode": "real API" if CONFIG["bls_key"] else "static fallback",
+                "unemployment_states_real":     BLS_STATS["unemployment_real"],
+                "unemployment_states_fallback": BLS_STATS["unemployment_fallback"],
+                "wage_growth_states_real":      BLS_STATS["wage_real"],
+                "wage_growth_states_fallback":  BLS_STATS["wage_fallback"],
+            },
             "fbi":       {
                 "mode": "real API" if CONFIG["fbi_key"] else "static fallback",
-                "states_real":     FBI_STATS["real"],
-                "states_fallback": FBI_STATS["fallback"],
+                "violent_states_real":      FBI_STATS["violent_real"],
+                "violent_states_fallback":  FBI_STATS["violent_fallback"],
+                "property_states_real":     FBI_STATS["property_real"],
+                "property_states_fallback": FBI_STATS["property_fallback"],
             },
-            "noaa":      "real API" if CONFIG["noaa_key"] else "static fallback",
+            "noaa":      {
+                "mode": "real API" if CONFIG["noaa_key"] else "static fallback",
+                "states_real":     NOAA_STATS["real"],
+                "states_fallback": NOAA_STATS["fallback"],
+            },
             "walkscore": {
                 "mode": "real API" if CONFIG["walkscore_key"] else "state defaults",
                 "cities_real":     WALKSCORE_STATS["real"],
