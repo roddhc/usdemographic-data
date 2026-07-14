@@ -669,7 +669,51 @@ def fetch_noaa_climate_data(states: list[str]) -> dict[str, tuple[float, float]]
     log.info(f"NOAA climate data: retrieved {len(result)} states")
     return result
 
+# ── Geocoding (Census Geocoder — free, no key required) ───────────────────────
+# Walk Score's API requires lat/lon on every request (address alone is not
+# accepted), and nothing upstream in this pipeline produces coordinates.
+# We geocode each city once via the Census Bureau's public geocoder so
+# fetch_walkscore() has real coordinates to send.
+
+_GEOCODE_CACHE: dict[str, tuple[float, float] | None] = {}
+
+def geocode_city(city: str, state: str) -> tuple[float | None, float | None]:
+    """Returns (lat, lon) for a city centroid, or (None, None) if it can't
+    be resolved. Uses the free Census Geocoder (geocoding.geo.census.gov) —
+    no API key needed. Results are cached per city+state for the run."""
+    cache_key = f"{city.lower()}_{state}"
+    if cache_key in _GEOCODE_CACHE:
+        cached = _GEOCODE_CACHE[cache_key]
+        return cached if cached else (None, None)
+
+    try:
+        resp = requests.get(
+            "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress",
+            params={
+                "address": f"{city}, {state}",
+                "benchmark": "Public_AR_Current",
+                "format": "json",
+            },
+            timeout=10,
+            headers={"User-Agent": "CityCompare-Pipeline/2.0"},
+        )
+        time.sleep(CONFIG["request_delay"])
+        if resp.status_code == 200:
+            matches = resp.json().get("result", {}).get("addressMatches", [])
+            if matches:
+                coords = matches[0]["coordinates"]
+                lat, lon = float(coords["y"]), float(coords["x"])
+                _GEOCODE_CACHE[cache_key] = (lat, lon)
+                return lat, lon
+    except Exception as e:
+        log.debug(f"Geocoding failed for {city}, {state}: {e}")
+
+    _GEOCODE_CACHE[cache_key] = None
+    return None, None
+
 # ── Walk Score ────────────────────────────────────────────────────────────────
+
+WALKSCORE_STATS = {"real": 0, "fallback": 0}
 
 def fetch_walkscore(city: str, state: str,
                     lat: float = None, lon: float = None) -> tuple[float, float]:
@@ -689,10 +733,12 @@ def fetch_walkscore(city: str, state: str,
                 walk = float(d.get("walkscore", 0) or 0)
                 transit = float((d.get("transit") or {}).get("score", 0) or 0)
                 time.sleep(CONFIG["request_delay"])
+                WALKSCORE_STATS["real"] += 1
                 return walk, transit
         except Exception as e:
             log.debug(f"Walk Score failed for {city}, {state}: {e}")
 
+    WALKSCORE_STATS["fallback"] += 1
     return (float(WALKSCORE_STATE_FALLBACK.get(state, 40)),
             float(WALKSCORE_TRANSIT_FALLBACK.get(state, 25)))
 
@@ -735,7 +781,8 @@ def build_city_record(
     violent, prop_crime, crime_conf = crime
     hdd, cdd = climate
 
-    walk, transit_idx = fetch_walkscore(city, state)
+    geo_lat, geo_lon = geocode_city(city, state)
+    walk, transit_idx = fetch_walkscore(city, state, geo_lat, geo_lon)
     col_idx, grocery_idx = get_col_data(city, state, static.get("meric", {}))
 
     taxes   = static.get("taxes", {})
@@ -924,7 +971,11 @@ def main():
             "bls":       "real API" if CONFIG["bls_key"] else "static fallback",
             "fbi":       "real API" if CONFIG["fbi_key"] else "static fallback",
             "noaa":      "real API" if CONFIG["noaa_key"] else "static fallback",
-            "walkscore": "real API" if CONFIG["walkscore_key"] else "state defaults",
+            "walkscore": {
+                "mode": "real API" if CONFIG["walkscore_key"] else "state defaults",
+                "cities_real":     WALKSCORE_STATS["real"],
+                "cities_fallback": WALKSCORE_STATS["fallback"],
+            },
         },
         "files": {
             "cities_free": "cities_free.json",
