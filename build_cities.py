@@ -584,43 +584,34 @@ def _fetch_fbi_offense_rate(state: str, offense: str, fbi_key: str) -> float | N
     the FBI CDE API. Returns None on any failure so the caller can fall
     back. Retries once on connection-level failures (short backoff).
 
-    Tries two known URL conventions per attempt — recent examples use
-    /crime/fbi/cde/... with uppercase API_KEY, older examples use
-    /crime/fbi/sapi/api/... with lowercase api_key. We've seen consistent
-    400s on the first with no way to confirm the second without testing,
-    so try both rather than guess-and-wait another round trip.
+    Date range must be MM-YYYY per state (confirmed from the API's own
+    400 error body: "From year and month date is not valid, expected
+    format MM-YYYY."). A bare year (e.g. "2022") was silently invalid.
+    Covers the full 2022 calendar year: 01-2022 through 12-2022.
     """
-    candidates = [
-        f"https://api.usa.gov/crime/fbi/cde/summarized/state/{state}/{offense}"
-        f"?from=2022&to=2022&API_KEY={fbi_key}",
-        f"https://api.usa.gov/crime/fbi/sapi/api/summarized/state/{state}/{offense}"
-        f"?from=2022&to=2022&api_key={fbi_key}",
-    ]
+    url = (f"https://api.usa.gov/crime/fbi/cde/summarized/state/{state}/{offense}"
+           f"?from=01-2022&to=12-2022&API_KEY={fbi_key}")
     for attempt in range(2):
-        for url in candidates:
-            try:
-                resp = requests.get(url, timeout=15,
-                                   headers={"User-Agent": "CityCompare-Pipeline/2.0"})
-                if resp.status_code == 200:
-                    data = resp.json()
-                    rate = 0.0
-                    for entry in data:
-                        if entry.get("offense", "").lower() == offense:
-                            rate = float(entry.get("crime_rate", 0) or 0)
-                    return rate if rate > 0 else None
-                else:
-                    log.warning(f"FBI API returned {resp.status_code} for {state} "
-                               f"{offense} (attempt {attempt + 1}/2, "
-                               f"url={'cde' if 'cde' in url else 'sapi'})")
-                    if resp.status_code == 400 and FBI_STATS_DEBUG_COUNT["n"] < 6:
-                        log.warning(f"[fbi-debug] {state} {offense} "
-                                   f"({'cde' if 'cde' in url else 'sapi'}) "
-                                   f"400 body: {resp.text[:300]!r}")
-                        FBI_STATS_DEBUG_COUNT["n"] += 1
-            except Exception as e:
-                log.warning(f"FBI fetch failed for {state} {offense}: {e} "
-                           f"(attempt {attempt + 1}/2, "
-                           f"url={'cde' if 'cde' in url else 'sapi'})")
+        try:
+            resp = requests.get(url, timeout=15,
+                               headers={"User-Agent": "CityCompare-Pipeline/2.0"})
+            if resp.status_code == 200:
+                data = resp.json()
+                rate = 0.0
+                for entry in data:
+                    if entry.get("offense", "").lower() == offense:
+                        rate = float(entry.get("crime_rate", 0) or 0)
+                return rate if rate > 0 else None
+            else:
+                log.warning(f"FBI API returned {resp.status_code} for {state} "
+                           f"{offense} (attempt {attempt + 1}/2)")
+                if resp.status_code == 400 and FBI_STATS_DEBUG_COUNT["n"] < 6:
+                    log.warning(f"[fbi-debug] {state} {offense} "
+                               f"400 body: {resp.text[:300]!r}")
+                    FBI_STATS_DEBUG_COUNT["n"] += 1
+        except Exception as e:
+            log.warning(f"FBI fetch failed for {state} {offense}: {e} "
+                       f"(attempt {attempt + 1}/2)")
         if attempt == 0:
             time.sleep(2)
     return None
@@ -639,10 +630,12 @@ def fetch_fbi_state_data(states: list[str]) -> dict[str, tuple[float, float, str
     Circuit breaker: if the first CIRCUIT_BREAKER_THRESHOLD states in a
     row completely fail (both offenses, all attempts), we stop making
     live HTTP calls for the rest of this run and go straight to fallback.
-    The FBI CDE backend behind api.usa.gov has been down for hours across
-    multiple runs today — continuing to retry every remaining state would
-    burn ~40 minutes of CI time for no benefit. The next scheduled run
-    tries again from scratch.
+    This was originally added while the backend appeared to be down for
+    hours at a time — the actual root cause turned out to be a date
+    format bug (from/to needed MM-YYYY, not a bare year), now fixed in
+    _fetch_fbi_offense_rate. Keeping the breaker as a safety net for any
+    genuine future outage, so a bad run can't silently burn ~40 minutes
+    retrying every state against a service that's actually down.
     """
     fbi_key = CONFIG["fbi_key"]
     if not fbi_key:
