@@ -597,11 +597,20 @@ def _fetch_fbi_offense_rate(state: str, offense: str, fbi_key: str) -> float | N
                                headers={"User-Agent": "CityCompare-Pipeline/2.0"})
             if resp.status_code == 200:
                 data = resp.json()
-                rate = 0.0
-                for entry in data:
-                    if entry.get("offense", "").lower() == offense:
-                        rate = float(entry.get("crime_rate", 0) or 0)
-                return rate if rate > 0 else None
+                try:
+                    rate = 0.0
+                    for entry in data:
+                        if entry.get("offense", "").lower() == offense:
+                            rate = float(entry.get("crime_rate", 0) or 0)
+                    return rate if rate > 0 else None
+                except (AttributeError, TypeError) as e:
+                    if FBI_STATS_DEBUG_COUNT["n"] < 6:
+                        log.warning(f"[fbi-debug] {state} {offense}: got 200 but "
+                                   f"response shape wasn't the expected list-of-"
+                                   f"dicts ({e!r}). type(data)={type(data).__name__}, "
+                                   f"raw body: {resp.text[:500]!r}")
+                        FBI_STATS_DEBUG_COUNT["n"] += 1
+                    return None
             else:
                 log.warning(f"FBI API returned {resp.status_code} for {state} "
                            f"{offense} (attempt {attempt + 1}/2)")
