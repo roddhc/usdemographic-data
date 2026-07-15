@@ -576,34 +576,51 @@ FBI_STATS = {"violent_real": 0, "violent_fallback": 0,
              "property_real": 0, "property_fallback": 0,
              "circuit_tripped": False}
 
+FBI_STATS_DEBUG_COUNT = {"n": 0}
+
 def _fetch_fbi_offense_rate(state: str, offense: str, fbi_key: str) -> float | None:
     """
     Fetch one offense category's crime rate per 100k for one state from
     the FBI CDE API. Returns None on any failure so the caller can fall
-    back. Retries once on connection-level failures (short backoff) —
-    enough to ride out a brief blip without adding much time when the
-    backend is genuinely down for hours, which is what we've observed
-    across several runs today.
+    back. Retries once on connection-level failures (short backoff).
+
+    Tries two known URL conventions per attempt — recent examples use
+    /crime/fbi/cde/... with uppercase API_KEY, older examples use
+    /crime/fbi/sapi/api/... with lowercase api_key. We've seen consistent
+    400s on the first with no way to confirm the second without testing,
+    so try both rather than guess-and-wait another round trip.
     """
-    base = "https://api.usa.gov/crime/fbi/cde"
+    candidates = [
+        f"https://api.usa.gov/crime/fbi/cde/summarized/state/{state}/{offense}"
+        f"?from=2022&to=2022&API_KEY={fbi_key}",
+        f"https://api.usa.gov/crime/fbi/sapi/api/summarized/state/{state}/{offense}"
+        f"?from=2022&to=2022&api_key={fbi_key}",
+    ]
     for attempt in range(2):
-        try:
-            url = f"{base}/summarized/state/{state}/{offense}?from=2022&to=2022&API_KEY={fbi_key}"
-            resp = requests.get(url, timeout=15,
-                               headers={"User-Agent": "CityCompare-Pipeline/2.0"})
-            if resp.status_code == 200:
-                data = resp.json()
-                rate = 0.0
-                for entry in data:
-                    if entry.get("offense", "").lower() == offense:
-                        rate = float(entry.get("crime_rate", 0) or 0)
-                return rate if rate > 0 else None
-            else:
-                log.warning(f"FBI API returned {resp.status_code} for {state} "
-                           f"{offense} (attempt {attempt + 1}/2)")
-        except Exception as e:
-            log.warning(f"FBI fetch failed for {state} {offense}: {e} "
-                       f"(attempt {attempt + 1}/2)")
+        for url in candidates:
+            try:
+                resp = requests.get(url, timeout=15,
+                                   headers={"User-Agent": "CityCompare-Pipeline/2.0"})
+                if resp.status_code == 200:
+                    data = resp.json()
+                    rate = 0.0
+                    for entry in data:
+                        if entry.get("offense", "").lower() == offense:
+                            rate = float(entry.get("crime_rate", 0) or 0)
+                    return rate if rate > 0 else None
+                else:
+                    log.warning(f"FBI API returned {resp.status_code} for {state} "
+                               f"{offense} (attempt {attempt + 1}/2, "
+                               f"url={'cde' if 'cde' in url else 'sapi'})")
+                    if resp.status_code == 400 and FBI_STATS_DEBUG_COUNT["n"] < 6:
+                        log.warning(f"[fbi-debug] {state} {offense} "
+                                   f"({'cde' if 'cde' in url else 'sapi'}) "
+                                   f"400 body: {resp.text[:300]!r}")
+                        FBI_STATS_DEBUG_COUNT["n"] += 1
+            except Exception as e:
+                log.warning(f"FBI fetch failed for {state} {offense}: {e} "
+                           f"(attempt {attempt + 1}/2, "
+                           f"url={'cde' if 'cde' in url else 'sapi'})")
         if attempt == 0:
             time.sleep(2)
     return None
