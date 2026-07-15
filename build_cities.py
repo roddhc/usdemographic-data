@@ -588,6 +588,13 @@ def _fetch_fbi_offense_rate(state: str, offense: str, fbi_key: str) -> float | N
     400 error body: "From year and month date is not valid, expected
     format MM-YYYY."). A bare year (e.g. "2022") was silently invalid.
     Covers the full 2022 calendar year: 01-2022 through 12-2022.
+
+    Response shape (confirmed from a real 200 body, not assumed):
+    {"offenses": {"rates": {"<State Name> Offenses": {"01-2022": 59.57,
+    ..., "12-2022": 54.53}, "<State Name> Clearances": {...},
+    "United States Offenses": {...}, "United States Clearances": {...}}}}
+    Values are monthly rates per 100k, keyed by full state name (not
+    abbreviation) — summing the 12 months gives the annual rate.
     """
     url = (f"https://api.usa.gov/crime/fbi/cde/summarized/state/{state}/{offense}"
            f"?from=01-2022&to=12-2022&API_KEY={fbi_key}")
@@ -598,16 +605,15 @@ def _fetch_fbi_offense_rate(state: str, offense: str, fbi_key: str) -> float | N
             if resp.status_code == 200:
                 data = resp.json()
                 try:
-                    rate = 0.0
-                    for entry in data:
-                        if entry.get("offense", "").lower() == offense:
-                            rate = float(entry.get("crime_rate", 0) or 0)
-                    return rate if rate > 0 else None
-                except (AttributeError, TypeError) as e:
+                    state_name = STATE_NAMES.get(state, state)
+                    rates = data["offenses"]["rates"]
+                    monthly = rates.get(f"{state_name} Offenses", {})
+                    annual_rate = sum(float(v) for v in monthly.values())
+                    return annual_rate if annual_rate > 0 else None
+                except (KeyError, TypeError, ValueError) as e:
                     if FBI_STATS_DEBUG_COUNT["n"] < 6:
                         log.warning(f"[fbi-debug] {state} {offense}: got 200 but "
-                                   f"response shape wasn't the expected list-of-"
-                                   f"dicts ({e!r}). type(data)={type(data).__name__}, "
+                                   f"couldn't extract monthly rates ({e!r}). "
                                    f"raw body: {resp.text[:500]!r}")
                         FBI_STATS_DEBUG_COUNT["n"] += 1
                     return None
