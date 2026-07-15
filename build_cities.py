@@ -423,7 +423,7 @@ def fetch_qcew_wage_growth(state: str) -> float | None:
     size/ownership/industry codes into one string, which is easy to get
     subtly wrong). We fetch the state-total, all-industries row
     (own_code=0, industry_code=10) for two years and compute % change
-    ourselves from avg_wkly_wage, rather than trust a column name we
+    ourselves from annual_avg_wkly_wage, rather than trust a column name we
     haven't verified exists in the annual file layout.
     Returns None if either year's row can't be found.
     """
@@ -448,7 +448,15 @@ def fetch_qcew_wage_growth(state: str) -> float | None:
             for row in reader:
                 rows_seen += 1
                 if row.get("own_code") == "0" and row.get("industry_code") == "10":
-                    return float(row["avg_wkly_wage"])
+                    try:
+                        return float(row["annual_avg_wkly_wage"])
+                    except (KeyError, ValueError, TypeError) as e:
+                        if BLS_STATS["_qcew_debug_count"] < 8:
+                            log.warning(f"[qcew-debug] {state} {year}: matched row but "
+                                       f"couldn't read annual_avg_wkly_wage ({e!r}). "
+                                       f"Row keys: {list(row.keys())}. Row values: {row}")
+                            BLS_STATS["_qcew_debug_count"] += 1
+                        return None
             if BLS_STATS["_qcew_debug_count"] < 8:
                 log.warning(f"[qcew-debug] {state} {year}: got 200 and {rows_seen} rows "
                            f"but none matched own_code=0/industry_code=10. "
