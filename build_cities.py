@@ -968,6 +968,7 @@ def confidence_index(level: str) -> int:
 #   Athens, GA     -> "Athens-Clarke County unified government (balance)"
 #   Augusta, GA    -> "Augusta-Richmond County consolidated government (balance)"
 #   Butte, MT      -> "Butte-Silver Bow (balance)" (no "government" suffix at all)
+#   Nashville, TN  -> "Nashville-Davidson metropolitan government (balance)"
 # NOT included: Carson City, NV — the Census Bureau treats it as a
 # county-equivalent, not a "place", so it never appears in this
 # for=place:* query regardless of name-cleaning. Fixing that needs a
@@ -978,6 +979,7 @@ CONSOLIDATED_CITY_ALIASES = {
     "athens":     "athens-clarke county",
     "augusta":    "augusta-richmond county",
     "butte":      "butte-silver bow",
+    "nashville":  "nashville-davidson",
 }
 
 
@@ -1003,6 +1005,26 @@ def build_city_record(
                       "Census treats it as a county-equivalent, so it never "
                       "appears in the place-level query regardless of name "
                       "cleaning. Needs a separate county-level fetch.")
+        else:
+            # General near-miss diagnostic: rather than guess at every new
+            # unmatched city (as the aliases above had to be reverse-
+            # engineered from Wikipedia/QuickFacts), surface whatever the
+            # live Census response actually called similarly-named places,
+            # so the real fix is one log line away instead of more research.
+            near = sorted({
+                v["census_name"] for k, v in census.items()
+                if city.lower() in k or k in city.lower()
+            })
+            if near:
+                log.info(f"  {city}, {state}: no exact match, but found "
+                          f"similar Census place name(s): {near[:3]} — "
+                          f"likely the real name, just spelled/split "
+                          f"differently than the CSV.")
+            else:
+                log.info(f"  {city}, {state}: no match and nothing similar "
+                          f"in this state's Census results at all — may be "
+                          f"a real population-threshold exclusion rather "
+                          f"than a naming issue.")
         return None
 
     population = cdata["population"]
