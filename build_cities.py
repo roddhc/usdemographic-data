@@ -1013,6 +1013,117 @@ def build_city_record(
 def to_free(record: dict) -> dict:
     return {k: v for k, v in record.items() if k in FREE_FIELDS}
 
+# ── Release quality gate ───────────────────────────────────────────────────────
+#
+# Every other check in this pipeline (circuit breakers, fallback constants,
+# "Verify output files exist" in the workflow) makes sure a run finishes
+# without crashing. None of them check whether the run was actually GOOD.
+# On 2026-07-15, Walk Score silently went from 1,531/1,844 real to 0/1,844
+# real (daily quota exceeded, status 41) and still published as "latest"
+# because the file existed and had the right shape — it just had the wrong
+# data in it. This gate compares this run's per-source real-data fraction
+# against the currently-published release and refuses to let a regressed
+# run become the new "latest" release. The Flutter app always pulls
+# "latest", so this is the last line of defense before bad data ships.
+
+PREVIOUS_MANIFEST_URL = (
+    "https://github.com/roddhc/usdemographic-data/releases/latest/download/manifest.json"
+)
+
+# How far a source's real-data fraction is allowed to fall, run-over-run,
+# before the gate blocks the release. 0.40 means e.g. 83% real -> 0% real
+# (exactly the Walk Score case) trips it, but normal noise (50/51 -> 49/51
+# states) doesn't.
+QUALITY_GATE_MAX_DROP = 0.40
+
+
+def _source_real_fraction(source_stats: dict) -> float | None:
+    """
+    Given one manifest['api_sources'][<name>] dict, return the fraction of
+    records that were real (not fallback), or None if this source's stats
+    don't have a recognizable real/fallback pair (e.g. "census", which is
+    just a string) — the gate skips those rather than guessing.
+    """
+    pairs = [
+        ("cities_real", "cities_fallback"),
+        ("states_real", "states_fallback"),
+        ("unemployment_states_real", "unemployment_states_fallback"),
+        ("wage_growth_states_real", "wage_growth_states_fallback"),
+        ("violent_states_real", "violent_states_fallback"),
+        ("property_states_real", "property_states_fallback"),
+    ]
+    for real_key, fallback_key in pairs:
+        if isinstance(source_stats, dict) and real_key in source_stats:
+            real = source_stats[real_key]
+            fallback = source_stats.get(fallback_key, 0)
+            total = real + fallback
+            return (real / total) if total else None
+    return None
+
+
+def run_quality_gate(manifest: dict) -> None:
+    """
+    Fetches the manifest.json from the currently-published "latest"
+    release and compares it against this run's manifest, source by
+    source. If any source's real-data fraction dropped by more than
+    QUALITY_GATE_MAX_DROP, logs exactly what regressed and exits 1 so
+    the workflow stops before the "Create GitHub Release" step —
+    the previous (good) release stays live instead of being overwritten.
+
+    Fails open (does not block) if there's no previous release yet, or
+    if the previous manifest can't be fetched at all — a network hiccup
+    on our side reaching GitHub shouldn't be treated the same as an
+    actual data regression.
+    """
+    try:
+        resp = requests.get(PREVIOUS_MANIFEST_URL, timeout=15)
+        if resp.status_code != 200:
+            log.info("Quality gate: no previous release manifest found "
+                      "(first run?) — nothing to compare against, skipping.")
+            return
+        previous = resp.json()
+    except Exception as e:
+        log.warning(f"Quality gate: couldn't fetch previous manifest ({e}) — "
+                    f"skipping rather than blocking a release over our own "
+                    f"network issue.")
+        return
+
+    prev_sources = previous.get("api_sources", {})
+    curr_sources = manifest.get("api_sources", {})
+    regressions = []
+
+    for name, curr_stats in curr_sources.items():
+        prev_stats = prev_sources.get(name)
+        if prev_stats is None:
+            continue
+        curr_frac = _source_real_fraction(curr_stats)
+        prev_frac = _source_real_fraction(prev_stats)
+        if curr_frac is None or prev_frac is None:
+            continue
+        drop = prev_frac - curr_frac
+        if drop > QUALITY_GATE_MAX_DROP:
+            regressions.append(
+                f"{name}: real data fraction dropped from {prev_frac:.0%} "
+                f"to {curr_frac:.0%} versus the currently-live release"
+            )
+
+    if regressions:
+        log.error("=" * 60)
+        log.error("QUALITY GATE FAILED — refusing to publish this run as "
+                   "the new release:")
+        for r in regressions:
+            log.error(f"  - {r}")
+        log.error("Likely cause: an exhausted API quota, an expired/invalid "
+                   "key, or a broken endpoint — not a real drop in data "
+                   "availability. Fix the cause and re-run. The previous "
+                   "release remains live in the meantime, so nothing is "
+                   "downgraded for users.")
+        log.error("=" * 60)
+        sys.exit(1)
+
+    log.info("Quality gate passed — no source regressed beyond "
+              f"{QUALITY_GATE_MAX_DROP:.0%} versus the live release.")
+
 # ── Main pipeline ─────────────────────────────────────────────────────────────
 
 def main():
@@ -1157,6 +1268,10 @@ def main():
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
     log.info(f"Wrote {manifest_path}")
+
+    # Refuses to let this run publish if a source has regressed hard
+    # against the release that's currently live (see function docstring).
+    run_quality_gate(manifest)
 
     log.info("\n" + "=" * 60)
     log.info(f"Pipeline complete. {len(valid_records)} cities.")
