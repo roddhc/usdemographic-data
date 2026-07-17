@@ -1006,25 +1006,48 @@ def build_city_record(
                       "appears in the place-level query regardless of name "
                       "cleaning. Needs a separate county-level fetch.")
         else:
-            # General near-miss diagnostic: rather than guess at every new
-            # unmatched city (as the aliases above had to be reverse-
-            # engineered from Wikipedia/QuickFacts), surface whatever the
-            # live Census response actually called similarly-named places,
-            # so the real fix is one log line away instead of more research.
-            near = sorted({
-                v["census_name"] for k, v in census.items()
-                if city.lower() in k or k in city.lower()
-            })
-            if near:
-                log.info(f"  {city}, {state}: no exact match, but found "
-                          f"similar Census place name(s): {near[:3]} — "
-                          f"likely the real name, just spelled/split "
-                          f"differently than the CSV.")
+            # Confirmed against three real cases (Spring Valley, Kailua,
+            # Woodlawn): a single unambiguous near miss auto-resolves
+            # instead of just being logged for a human to go verify.
+            #
+            # Matching is a WORD-BOUNDARY-safe prefix check, not a bare
+            # substring or bare .startswith() — bare substring would let
+            # "York" wrongly match "New York" (contains it), and bare
+            # .startswith() would still wrongly match "Yorktown" (starts
+            # with it, but "t" right after isn't a boundary). Requiring
+            # the character right after the shorter name to be a space or
+            # end-of-string rejects both, while still accepting "York" vs
+            # "York CDP".
+            def _is_prefix_match(a: str, b: str) -> bool:
+                shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+                if not longer.startswith(shorter):
+                    return False
+                return len(longer) == len(shorter) or longer[len(shorter)] == " "
+
+            city_key = city.lower()
+            candidates = {
+                k: v for k, v in census.items() if _is_prefix_match(city_key, k)
+            }
+            if len(candidates) == 1:
+                (_, only_val), = candidates.items()
+                log.warning(f"  {city}, {state}: no exact key match — "
+                            f"auto-resolved to the one unambiguous "
+                            f"similarly-named Census place: "
+                            f"'{only_val['census_name']}'. Logged as a "
+                            f"warning, not silently, since it's a fuzzy "
+                            f"match rather than an exact one.")
+                cdata = only_val
+            elif candidates:
+                log.info(f"  {city}, {state}: no exact match, and "
+                          f"{len(candidates)} similarly-named Census "
+                          f"places found — ambiguous, not auto-resolving: "
+                          f"{sorted(v['census_name'] for v in candidates.values())}")
             else:
                 log.info(f"  {city}, {state}: no match and nothing similar "
                           f"in this state's Census results at all — may be "
                           f"a real population-threshold exclusion rather "
                           f"than a naming issue.")
+    if not cdata:
         return None
 
     population = cdata["population"]
