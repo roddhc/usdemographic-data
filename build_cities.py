@@ -1393,13 +1393,19 @@ def main():
         json.dump(manifest, f, indent=2)
     log.info(f"Wrote {manifest_path}")
 
+    # Done geocoding for this run — close it now, deterministically,
+    # instead of leaving it for interpreter shutdown (see docstring).
+    #
+    # This MUST run before run_quality_gate(): that function can call
+    # sys.exit(1) when a source has regressed, which would otherwise skip
+    # this line entirely and reintroduce the exact uszipcode shutdown
+    # warning this was written to fix — confirmed happening in practice
+    # on 2026-07-17 the first time the gate actually failed for real.
+    close_geocoder()
+
     # Refuses to let this run publish if a source has regressed hard
     # against the release that's currently live (see function docstring).
     run_quality_gate(manifest)
-
-    # Done geocoding for this run — close it now, deterministically,
-    # instead of leaving it for interpreter shutdown (see docstring).
-    close_geocoder()
 
     log.info("\n" + "=" * 60)
     log.info(f"Pipeline complete. {len(valid_records)} cities.")
