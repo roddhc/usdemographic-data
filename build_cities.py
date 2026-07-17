@@ -371,6 +371,23 @@ def fetch_census_acs(state_abbr: str) -> dict:
             if city_clean.lower().endswith(sfx.lower()):
                 city_clean = city_clean[:-len(sfx)].strip()
                 break
+
+        # Several California cities carry a legal name with the common
+        # name parenthesized, e.g. "San Buenaventura (Ventura)" and
+        # "El Paso de Robles (Paso Robles)" — confirmed against the
+        # Census Bureau's own place names, not assumed. Previously this
+        # regex just discarded the parenthetical, keeping only the legal
+        # name as the lookup key ("san buenaventura") — so a dataset
+        # that (reasonably) calls the city "Ventura" could never match.
+        # Capture the common name before discarding it so both resolve.
+        paren_alias = None
+        paren_match = re.search(r'\(([^)]+)\)\s*$', city_clean)
+        if paren_match and paren_match.group(1).strip().lower() != "balance":
+            # Excludes "(balance)" itself — that's the Census Bureau's own
+            # marker for a consolidated-government remainder, e.g. in
+            # "Butte-Silver Bow (balance)", not an actual alternate city
+            # name like "(Ventura)" or "(Paso Robles)" are.
+            paren_alias = paren_match.group(1).strip()
         city_clean = re.sub(r'\s*\(.*?\)\s*$', '', city_clean).strip()
 
         def safe_float(val, fallback=0.0):
@@ -395,7 +412,7 @@ def fetch_census_acs(state_abbr: str) -> dict:
         else:
             prop_tax_rate = 1.0
 
-        result[city_clean.lower()] = {
+        record = {
             "census_name":           city_clean,
             "population":            int(pop),
             "medianHomePrice":       safe_float(r.get("B25077_001E")),
@@ -404,6 +421,11 @@ def fetch_census_acs(state_abbr: str) -> dict:
             "avgCommuteMinutes":     avg_commute if avg_commute > 5 else 27.0,
             "effectivePropertyTaxRate": prop_tax_rate,
         }
+        result[city_clean.lower()] = record
+        if paren_alias:
+            # Same place, second key — e.g. "paso robles" now also
+            # resolves to the "El Paso de Robles" record above.
+            result[paren_alias.lower()] = record
 
     time.sleep(CONFIG["request_delay"])
     return result
@@ -841,6 +863,29 @@ def geocode_city(city: str, state: str) -> tuple[float | None, float | None]:
     _GEOCODE_CACHE[cache_key] = None
     return None, None
 
+
+def close_geocoder() -> None:
+    """
+    Explicitly closes and drops the module-level uszipcode engine once
+    we're done geocoding for this run.
+
+    uszipcode's own __del__ never clears self.ses after close(), so if we
+    leave this to the garbage collector it fires again during interpreter
+    shutdown — by then Python has already begun tearing down the sqlite3
+    C extension, so that second close() hits a connection that's been
+    forcibly killed out from under it, producing a harmless but noisy
+    "Cannot operate on a closed database" ProgrammingError at the very
+    end of the run. Closing it ourselves here, while the interpreter is
+    still fully alive, and then dropping the reference so __del__ has
+    nothing left to act on later, avoids the race entirely.
+    """
+    global _ZIP_ENGINE
+    try:
+        _ZIP_ENGINE.close()
+    except Exception as e:
+        log.debug(f"Geocoder close raised (harmless, ignoring): {e}")
+    _ZIP_ENGINE = None
+
 # ── Walk Score ────────────────────────────────────────────────────────────────
 
 WALKSCORE_STATS = {"real": 0, "fallback": 0, "status_counts": {}}
@@ -911,6 +956,31 @@ def confidence_index(level: str) -> int:
 
 # ── Build single city record ──────────────────────────────────────────────────
 
+# Consolidated city-county governments where the Census Bureau's place
+# name embeds the county/consolidated-entity name (joined by "/" or "-")
+# in a way the generic suffix list above can't safely strip — a blind
+# "/" or "-" split would also mangle legitimately hyphenated city names
+# already in this dataset, like Winston-Salem and Wilkes-Barre. Each
+# value here is exactly the key fetch_census_acs() produces for that
+# place after its own suffix-stripping — confirmed against the Census
+# Bureau's actual published place names, not guessed:
+#   Louisville, KY -> "Louisville/Jefferson County metro government (balance)"
+#   Athens, GA     -> "Athens-Clarke County unified government (balance)"
+#   Augusta, GA    -> "Augusta-Richmond County consolidated government (balance)"
+#   Butte, MT      -> "Butte-Silver Bow (balance)" (no "government" suffix at all)
+# NOT included: Carson City, NV — the Census Bureau treats it as a
+# county-equivalent, not a "place", so it never appears in this
+# for=place:* query regardless of name-cleaning. Fixing that needs a
+# separate county-level fetch, not a naming fix — see the note in
+# build_city_record() below.
+CONSOLIDATED_CITY_ALIASES = {
+    "louisville": "louisville/jefferson county",
+    "athens":     "athens-clarke county",
+    "augusta":    "augusta-richmond county",
+    "butte":      "butte-silver bow",
+}
+
+
 def build_city_record(
     city: str,
     state: str,
@@ -924,6 +994,15 @@ def build_city_record(
 
     cdata = census.get(city.lower())
     if not cdata:
+        alias = CONSOLIDATED_CITY_ALIASES.get(city.lower())
+        if alias:
+            cdata = census.get(alias)
+    if not cdata:
+        if city.lower() == "carson city":
+            log.info("  Carson City, NV: known gap, not a bug to chase — "
+                      "Census treats it as a county-equivalent, so it never "
+                      "appears in the place-level query regardless of name "
+                      "cleaning. Needs a separate county-level fetch.")
         return None
 
     population = cdata["population"]
@@ -1192,9 +1271,9 @@ def main():
                 failed.append(f"{city}, {state_abbr} (error: {e})")
 
     log.info(f"\nBuilt {len(all_records)} city records ({len(failed)} skipped)")
-    if failed[:10]:
-        log.info("Sample skipped cities:")
-        for f in failed[:10]:
+    if failed:
+        log.info("Skipped cities (all, not a sample):")
+        for f in failed:
             log.info(f"  {f}")
 
     # Sort
@@ -1272,6 +1351,10 @@ def main():
     # Refuses to let this run publish if a source has regressed hard
     # against the release that's currently live (see function docstring).
     run_quality_gate(manifest)
+
+    # Done geocoding for this run — close it now, deterministically,
+    # instead of leaving it for interpreter shutdown (see docstring).
+    close_geocoder()
 
     log.info("\n" + "=" * 60)
     log.info(f"Pipeline complete. {len(valid_records)} cities.")
